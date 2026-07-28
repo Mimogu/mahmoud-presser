@@ -1429,12 +1429,10 @@ def run_qt_app(engine):
 
         def on_mode_changed(self):
             idx = self.stack_widget.currentIndex()
-            if idx == 0:
-                self.stack_widget.setCurrentIndex(0)
-            elif idx == 1:
-                self.stack_widget.setCurrentIndex(1)
-            else:
-                self.stack_widget.setCurrentIndex(2)
+            mode_names = ["Single Clicker", "Macro Sequence", "Auto-Typer"]
+            if 0 <= idx < len(mode_names):
+                self.seq_status_lbl.setText(f"Status: ⏹ Ready — {mode_names[idx]} mode")
+                self.seq_status_lbl.setStyleSheet("font-weight: bold; color: #a6adc8;")
 
         def start_record(self, btn, target_entry, is_sequence_record=False, is_start_stop_record=False):
             dlg = KeyRecorderDialog(self)
