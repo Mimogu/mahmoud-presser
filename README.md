@@ -2,8 +2,6 @@
 
 **A Modern Cross-Platform Auto-Clicker, Macro Sequence Builder & Auto-Typer**
 
-![Mahmoud Presser](https://via.placeholder.com/800x400.png?text=Mahmoud+Presser)
-
 Mahmoud Presser is a state-of-the-art, cross-platform automation tool designed for both Windows and Linux (Wayland & X11). It allows you to create highly precise macro sequences, automate clicks, and simulate typing with a beautiful modern dark-mode GUI.
 
 ## 🚀 Features
