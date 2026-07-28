@@ -1,8 +1,8 @@
-# Mahmoud Presser
+# Mimogu Presser
 
 **A Modern Cross-Platform Auto-Clicker, Macro Sequence Builder & Auto-Typer**
 
-Mahmoud Presser is a state-of-the-art, cross-platform automation tool designed for both Windows and Linux (Wayland & X11). It allows you to create highly precise macro sequences, automate clicks, and simulate typing with a beautiful modern dark-mode GUI.
+Mimogu Presser is a state-of-the-art, cross-platform automation tool designed for both Windows and Linux (Wayland & X11). It allows you to create highly precise macro sequences, automate clicks, and simulate typing with a beautiful modern dark-mode GUI.
 
 ## 🚀 Features
 * **Cross-Platform Compatibility:** Native support for Windows and Linux (including full Wayland & X11 support).
@@ -16,7 +16,7 @@ Mahmoud Presser is a state-of-the-art, cross-platform automation tool designed f
 ## 🐧 Installation for Linux
 
 ### Method 1: Arch Linux (AUR) - *Recommended*
-Mahmoud Presser is officially available on the Arch User Repository (AUR). This is the absolute lightest and best way to install it, as it natively pulls the required PyQt6 dependencies.
+Mimogu Presser is officially available on the Arch User Repository (AUR). This is the absolute lightest and best way to install it, as it natively pulls the required PyQt6 dependencies.
 
 You can install it instantly using any AUR helper (like `paru` or `yay`):
 ```bash
@@ -24,7 +24,7 @@ paru -S mahmoud-presser
 # OR
 yay -S mahmoud-presser
 ```
-Once installed, simply launch **Mahmoud Presser** from your application menu or type `mahmoud-presser` in your terminal!
+Once installed, simply launch **Mimogu Presser** from your application menu or type `mahmoud-presser` in your terminal!
 
 ### Method 2: Manual / Other Distributions
 If you are on Ubuntu, Fedora, or another distribution, you can run the standalone script directly:
