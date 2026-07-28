@@ -16,15 +16,15 @@ Mahmoud Presser is a state-of-the-art, cross-platform automation tool designed f
 ## 🐧 Installation for Linux
 
 ### Method 1: Arch Linux (AUR) - *Recommended*
-For Arch Linux users, we provide a native AUR package that is incredibly lightweight (~100 KB) because it natively pulls dependencies from the system.
+Mahmoud Presser is officially available on the Arch User Repository (AUR). This is the absolute lightest and best way to install it, as it natively pulls the required PyQt6 dependencies.
 
-1. Navigate to the `aur_package` directory.
-2. Build and install the package using `makepkg`:
-   ```bash
-   cd aur_package
-   makepkg -si
-   ```
-3. Once installed, simply launch **Mahmoud Presser** from your application menu or type `mahmoud-presser` in your terminal.
+You can install it instantly using any AUR helper (like `paru` or `yay`):
+```bash
+paru -S mahmoud-presser
+# OR
+yay -S mahmoud-presser
+```
+Once installed, simply launch **Mahmoud Presser** from your application menu or type `mahmoud-presser` in your terminal!
 
 ### Method 2: Manual / Other Distributions
 If you are on Ubuntu, Fedora, or another distribution, you can run the standalone script directly:
