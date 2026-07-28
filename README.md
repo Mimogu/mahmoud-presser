@@ -45,17 +45,23 @@ If you are on Ubuntu, Fedora, or another distribution, you can run the standalon
 
 ## 🪟 Installation for Windows
 
-To keep the application as lightweight as possible without downloading hundreds of megabytes of bundled binaries, the Windows version runs directly via Python.
+> **⚠️ IMPORTANT REQUIREMENT FOR WINDOWS USERS:**
+> To keep this application extremely lightweight (a few kilobytes instead of a 300MB+ bloated executable), this app does NOT bundle the heavy Python engine. **You MUST download and install Python and its required packages manually for the application (or its lightweight `.exe`) to work.**
 
-1. **Install Python:** Download and install [Python 3.10+](https://www.python.org/downloads/). *(Make sure to check "Add Python to PATH" during installation).*
-2. **Install Dependencies:** Open Command Prompt and run:
+### Step-by-Step Instructions:
+
+1. **Download and Install Python:** 
+   Go to [Python.org](https://www.python.org/downloads/) and install Python 3.10 or newer. 
+   *(**Crucial:** When the installer opens, you MUST check the box at the bottom that says **"Add Python to PATH"** before clicking Install).*
+
+2. **Install Required Packages:** 
+   Open Command Prompt (`cmd`) and type the following command, then hit Enter:
    ```cmd
    pip install PyQt6 pynput
    ```
-3. **Run the App:** Double click `windows_clicker.py` or run it from the command line:
-   ```cmd
-   python windows_clicker.py
-   ```
+
+3. **Run the App:** 
+   You can now simply double-click the `windows_clicker.py` script to run it, or if you downloaded the lightweight `.exe` version, you can now run it perfectly!
 
 ---
 
