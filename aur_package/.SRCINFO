@@ -11,7 +11,7 @@ pkgbase = mahmoud-presser
 	depends = python-evdev
 	depends = python-gobject
 	source = linux_clicker.py
-	source = mahmoud-presser.desktop
+	source = mimogu-presser.desktop
 	sha256sums = SKIP
 	sha256sums = SKIP
 
