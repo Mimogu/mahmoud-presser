@@ -7,14 +7,14 @@ arch=('any')
 url="https://github.com/Mimogu/mahmoud-presser"
 license=('GPL')
 depends=('python' 'python-pyqt6' 'python-pynput' 'python-evdev' 'python-gobject')
-source=("linux_clicker.py"
+source=("presser_core.py"
         "mahmoud-presser.desktop")
 sha256sums=('SKIP'
             'SKIP')
 
 package() {
     # Install the main Python script as an executable in /usr/bin/
-    install -Dm755 "${srcdir}/linux_clicker.py" "${pkgdir}/usr/bin/mahmoud-presser"
+    install -Dm755 "${srcdir}/presser_core.py" "${pkgdir}/usr/bin/mahmoud-presser"
     
     # Install the desktop shortcut for application menus
     install -Dm644 "${srcdir}/mahmoud-presser.desktop" "${pkgdir}/usr/share/applications/mahmoud-presser.desktop"

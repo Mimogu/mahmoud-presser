@@ -1,0 +1,19 @@
+# Mahmoud Presser - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core GUI Framework (Required - Windows & Linux)
+PyQt6>=6.4
+# OR PyQt5 (auto-fallback if PyQt6 is unavailable)
+# PyQt5>=5.15
+
+# Keyboard/Mouse Control & Global Hotkeys (Required - All Platforms)
+pynput>=1.7
+
+# Linux evdev Backend (Optional - Linux only, for automated typing)
+evdev>=1.6; platform_system=="Linux"
+
+# X11 Key Resolution (Optional - Linux X11 only)
+python-xlib>=0.33; platform_system=="Linux"
+
+# GTK3 GUI (Optional - Linux only, Qt preferred)
+# PyGObject>=3.42; platform_system=="Linux"
