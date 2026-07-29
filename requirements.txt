@@ -1,7 +1,7 @@
 # Mahmoud Presser - Python Dependencies
 # Install with: pip install -r requirements.txt
 
-# Core GUI Framework (Required - Windows & Linux)
+# Core GUI Framework (Required - Windows, Linux & macOS)
 PyQt6>=6.4
 # OR PyQt5 (auto-fallback if PyQt6 is unavailable)
 # PyQt5>=5.15

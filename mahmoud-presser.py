@@ -2,9 +2,9 @@
 """
 Mahmoud Presser — Modern Cross-Platform Auto-Clicker, Macro Sequence Builder & Auto-Typer
 
-Compatible with Linux (Wayland/X11), Windows (10/11). macOS experimental.
+Compatible with Linux (Wayland/X11), Windows (10/11), and macOS.
 This is the single entry point — run it directly:
-    python presser_core.py
+    python mahmoud-presser.py
 
 Features:
  1. Multi-Column X11 & Cross-Platform Latin Base Key Resolution
@@ -15,6 +15,8 @@ Features:
  6. Multi-Key & Combination Support (e.g., ALT+A, CTRL+SHIFT+E)
  7. Combo-Aware Global Hotkey Listener
 """
+
+from __future__ import annotations
 
 import sys
 import os
@@ -29,6 +31,8 @@ import re
 import argparse
 import platform
 import atexit
+import importlib.util
+from typing import Any, Callable, Dict, List, Optional, Set
 
 # Platform Flags (Auto-detected)
 SYSTEM_NAME = platform.system().lower()
@@ -40,24 +44,37 @@ IS_MACOS = SYSTEM_NAME == "darwin"
 DEBUG = sys.stdout.isatty()  # Auto-enable debug logs when running from terminal
 
 
-def debug_log(msg):
+def debug_log(msg: str) -> None:
     """Print a debug message (only shows when running from terminal or --debug is passed)."""
     if DEBUG:
         print(f"[DEBUG] {msg}")
 
-# Auto-redirect execution to virtual environment if available
-venv_linux = os.path.expanduser("~/venv/bin/python3")
-venv_win = os.path.expanduser("~/venv/Scripts/python.exe")
-venv_python = venv_win if IS_WINDOWS else venv_linux
-
-if not getattr(sys, 'frozen', False) and os.path.exists(venv_python) and sys.executable != venv_python and "--no-reexec" not in sys.argv:
-    try:
-        os.execv(venv_python, [venv_python] + sys.argv)
-    except Exception:
-        pass
-
-# Optional Imports
+# --- Lazy imports (deferred for fast startup) ---
 EVDEV_AVAILABLE = False
+PYNPUT_AVAILABLE = False
+_pynput_module = None
+
+def _ensure_pynput():
+    """Lazy import of pynput — loaded only when first needed (start/record/hotkey)."""
+    global _pynput_module, PYNPUT_AVAILABLE
+    if _pynput_module is not None:
+        return _pynput_module
+    try:
+        import pynput
+        _pynput_module = pynput
+        PYNPUT_AVAILABLE = True
+        if IS_LINUX and hasattr(pynput.keyboard, '_xorg'):
+            _original_event_to_key = pynput.keyboard._xorg.Listener._event_to_key
+            def _patched_event_to_key(self, display, event):
+                key = _original_event_to_key(self, display, event)
+                if key is not None:
+                    key.hardware_keycode = event.detail
+                return key
+            pynput.keyboard._xorg.Listener._event_to_key = _patched_event_to_key
+    except ImportError:
+        PYNPUT_AVAILABLE = False
+    return _pynput_module
+
 if IS_LINUX:
     try:
         from evdev import UInput, ecodes as e
@@ -65,30 +82,32 @@ if IS_LINUX:
     except ImportError:
         EVDEV_AVAILABLE = False
 
-try:
-    import pynput
-    PYNPUT_AVAILABLE = True
-    if IS_LINUX and hasattr(pynput.keyboard, '_xorg'):
-        # Monkey patch pynput on X11 to extract raw hardware keycodes so we can dynamically 
-        # resolve base Latin keys regardless of active layout/Shift state.
-        _original_event_to_key = pynput.keyboard._xorg.Listener._event_to_key
-        def _patched_event_to_key(self, display, event):
-            key = _original_event_to_key(self, display, event)
-            if key is not None:
-                key.hardware_keycode = event.detail
-            return key
-        pynput.keyboard._xorg.Listener._event_to_key = _patched_event_to_key
-except ImportError:
-    PYNPUT_AVAILABLE = False
-
 # Cross-platform File Paths
 if IS_WINDOWS:
     CONFIG_DIR = os.environ.get("APPDATA", os.path.expanduser("~"))
     CONFIG_FILE = os.path.join(CONFIG_DIR, "mahmoud_presser.json")
     PID_FILE = os.path.join(tempfile.gettempdir(), "mahmoud_presser.pid")
-else:
-    CONFIG_FILE = os.path.expanduser("~/.config/wayland_mahmoud_presser.json")
+elif IS_MACOS:
+    CONFIG_DIR = os.path.expanduser("~/Library/Application Support/mahmoud-presser")
+    CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
     PID_FILE = os.path.join(tempfile.gettempdir(), "mahmoud_presser.pid")
+else:
+    # Detect display server to use appropriate config filename
+    _display_server = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if _display_server == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        _config_name = "wayland_mahmoud_presser.json"
+    else:
+        _config_name = "mahmoud_presser.json"
+    CONFIG_FILE = os.path.expanduser(f"~/.config/{_config_name}")
+    PID_FILE = os.path.join(tempfile.gettempdir(), "mahmoud_presser.pid")
+
+    # One-time migration from old wayland-only config name (for X11 users)
+    _old_wayland = os.path.expanduser("~/.config/wayland_mahmoud_presser.json")
+    if CONFIG_FILE != _old_wayland and os.path.exists(_old_wayland) and not os.path.exists(CONFIG_FILE):
+        try:
+            os.rename(_old_wayland, CONFIG_FILE)
+        except Exception:
+            CONFIG_FILE = _old_wayland  # fall back if rename fails
 
 # Cached X11 Display instance for dynamic system key queries
 X11_DISPLAY = None
@@ -161,7 +180,7 @@ if EVDEV_AVAILABLE:
     }
 
 
-def cleanup_pid():
+def cleanup_pid() -> None:
     """Remove PID file on exit."""
     try:
         if os.path.exists(PID_FILE):
@@ -170,7 +189,7 @@ def cleanup_pid():
         pass
 
 
-def acquire_pid_lock():
+def acquire_pid_lock() -> bool:
     """Try to acquire exclusive PID file lock. Returns True if successful (we are the sole instance)."""
     try:
         # Try exclusive create to detect another instance atomically
@@ -200,14 +219,21 @@ def acquire_pid_lock():
         return False
 
 
-def signal_cleanup(signum=None, frame=None):
-    """Signal handler for clean shutdown."""
+# Module-level engine reference for signal handler to stop running loops
+_engine_ref: Optional[PresserEngine] = None
+
+
+def signal_cleanup(signum: Optional[int] = None, frame: Optional[Any] = None) -> None:
+    """Signal handler for clean shutdown. Stops running click loops before exiting."""
+    global _engine_ref
+    if _engine_ref is not None:
+        _engine_ref.stop()
     cleanup_pid()
     sys.exit(0)
 
 
 
-def normalize_key_str(k):
+def normalize_key_str(k: Optional[str]) -> str:
     """Sanitizes key strings by mapping Shifted symbols / Arabic layout characters to standard ASCII QWERTY equivalents."""
     if not k:
         return "Mouse 1"
@@ -234,7 +260,7 @@ def normalize_key_str(k):
     return "+".join(ordered) if ordered else "Mouse 1"
 
 
-def resolve_x11_latin_base(code):
+def resolve_x11_latin_base(code: int) -> Optional[str]:
     """Iterates across all X11 KeySym columns (0-7) to dynamically extract the base Latin letter/digit for a keycode."""
     if not X11_DISPLAY or not isinstance(code, int) or not (8 <= code <= 255):
         return None
@@ -256,7 +282,7 @@ def resolve_x11_latin_base(code):
     return None
 
 
-def get_key_name_normalized(key):
+def get_key_name_normalized(key: Any) -> str:
     """Fully Automatic Multi-Column Dynamic Key Detection Engine across Linux (X11/Wayland), Windows, and macOS."""
     try:
         # 1. Special Named Keys (pynput.keyboard.Key instances like Key.up, Key.space, Key.shift)
@@ -312,7 +338,7 @@ def get_key_name_normalized(key):
     return str(key).upper()
 
 
-def save_config_atomic(filepath, cfg_data):
+def save_config_atomic(filepath: str, cfg_data: dict) -> bool:
     """Atomic configuration file write to prevent file corruption."""
     try:
         dir_name = os.path.dirname(filepath)
@@ -327,7 +353,7 @@ def save_config_atomic(filepath, cfg_data):
         return False
 
 
-def safe_float(val, default=0.0):
+def safe_float(val: Any, default: float = 0.0) -> float:
     """Safely parse a float from user input, returning default on failure."""
     try:
         return float(val or default)
@@ -335,7 +361,7 @@ def safe_float(val, default=0.0):
         return default
 
 
-def safe_int(val, default=0):
+def safe_int(val: Any, default: int = 0) -> int:
     """Safely parse an int from user input, returning default on failure."""
     try:
         return int(val or default)
@@ -346,17 +372,17 @@ def safe_int(val, default=0):
 class PresserEngine:
     """Universal Cross-Platform Automation Engine (Linux evdev/pynput, Windows & macOS pynput)."""
 
-    def __init__(self):
-        self.backend = "pynput"
-        self.ui = None
-        self.pynput_kb = None
-        self.pynput_ms = None
-        self.stop_event = threading.Event()
+    def __init__(self) -> None:
+        self.backend: str = "pynput"
+        self.ui: Any = None
+        self.pynput_kb: Any = None
+        self.pynput_ms: Any = None
+        self.stop_event: threading.Event = threading.Event()
 
         self.init_input_backend()
         debug_log(f"Engine initialized with backend: {self.backend}")
 
-    def init_input_backend(self):
+    def init_input_backend(self) -> None:
         if IS_LINUX and EVDEV_AVAILABLE:
             caps = {
                 e.EV_KEY: list(range(0, 0x2ff)),
@@ -369,10 +395,11 @@ class PresserEngine:
             except Exception:
                 self.ui = None
 
-        if PYNPUT_AVAILABLE:
+        pynput_mod = _ensure_pynput()
+        if pynput_mod:
             try:
-                self.pynput_kb = pynput.keyboard.Controller()
-                self.pynput_ms = pynput.mouse.Controller()
+                self.pynput_kb = pynput_mod.keyboard.Controller()
+                self.pynput_ms = pynput_mod.mouse.Controller()
                 self.backend = "pynput"
                 return
             except Exception as ex:
@@ -381,7 +408,7 @@ class PresserEngine:
         self.backend = "none"
         debug_log(f"No input backend available (evdev={EVDEV_AVAILABLE}, pynput={PYNPUT_AVAILABLE})")
 
-    def parse_single_key(self, key_str):
+    def parse_single_key(self, key_str: str) -> Optional[Any]:
         key_norm = normalize_key_str(key_str)
         key_upper = key_norm.upper()
 
@@ -402,40 +429,43 @@ class PresserEngine:
             return e.BTN_LEFT
 
         elif self.backend == "pynput":
+            pynput_mod = _ensure_pynput()
+            if not pynput_mod:
+                return None
             if key_upper in ["MOUSE 1", "LEFT", "BTN_LEFT"]:
-                return ("mouse", pynput.mouse.Button.left)
+                return ("mouse", pynput_mod.mouse.Button.left)
             if key_upper in ["MOUSE 2", "MIDDLE", "BTN_MIDDLE"]:
-                return ("mouse", pynput.mouse.Button.middle)
+                return ("mouse", pynput_mod.mouse.Button.middle)
             if key_upper in ["MOUSE 3", "RIGHT", "BTN_RIGHT"]:
-                return ("mouse", pynput.mouse.Button.right)
+                return ("mouse", pynput_mod.mouse.Button.right)
 
             pynput_map = {
-                "SPACE": pynput.keyboard.Key.space,
-                "ENTER": pynput.keyboard.Key.enter,
-                "RETURN": pynput.keyboard.Key.enter,
-                "TAB": pynput.keyboard.Key.tab,
-                "ESCAPE": pynput.keyboard.Key.esc,
-                "ESC": pynput.keyboard.Key.esc,
-                "BACKSPACE": pynput.keyboard.Key.backspace,
-                "SHIFT": pynput.keyboard.Key.shift,
-                "CTRL": pynput.keyboard.Key.ctrl,
-                "ALT": pynput.keyboard.Key.alt,
-                "SUPER": pynput.keyboard.Key.cmd,
-                "CAPS LOCK": pynput.keyboard.Key.caps_lock,
-                "UP": pynput.keyboard.Key.up,
-                "DOWN": pynput.keyboard.Key.down,
-                "LEFT": pynput.keyboard.Key.left,
-                "RIGHT": pynput.keyboard.Key.right,
-                "DELETE": pynput.keyboard.Key.delete,
-                "INSERT": pynput.keyboard.Key.insert,
-                "HOME": pynput.keyboard.Key.home,
-                "END": pynput.keyboard.Key.end,
-                "PAGE UP": pynput.keyboard.Key.page_up,
-                "PAGE DOWN": pynput.keyboard.Key.page_down,
-                "F1": pynput.keyboard.Key.f1, "F2": pynput.keyboard.Key.f2, "F3": pynput.keyboard.Key.f3,
-                "F4": pynput.keyboard.Key.f4, "F5": pynput.keyboard.Key.f5, "F6": pynput.keyboard.Key.f6,
-                "F7": pynput.keyboard.Key.f7, "F8": pynput.keyboard.Key.f8, "F9": pynput.keyboard.Key.f9,
-                "F10": pynput.keyboard.Key.f10, "F11": pynput.keyboard.Key.f11, "F12": pynput.keyboard.Key.f12,
+                "SPACE": pynput_mod.keyboard.Key.space,
+                "ENTER": pynput_mod.keyboard.Key.enter,
+                "RETURN": pynput_mod.keyboard.Key.enter,
+                "TAB": pynput_mod.keyboard.Key.tab,
+                "ESCAPE": pynput_mod.keyboard.Key.esc,
+                "ESC": pynput_mod.keyboard.Key.esc,
+                "BACKSPACE": pynput_mod.keyboard.Key.backspace,
+                "SHIFT": pynput_mod.keyboard.Key.shift,
+                "CTRL": pynput_mod.keyboard.Key.ctrl,
+                "ALT": pynput_mod.keyboard.Key.alt,
+                "SUPER": pynput_mod.keyboard.Key.cmd,
+                "CAPS LOCK": pynput_mod.keyboard.Key.caps_lock,
+                "UP": pynput_mod.keyboard.Key.up,
+                "DOWN": pynput_mod.keyboard.Key.down,
+                "LEFT": pynput_mod.keyboard.Key.left,
+                "RIGHT": pynput_mod.keyboard.Key.right,
+                "DELETE": pynput_mod.keyboard.Key.delete,
+                "INSERT": pynput_mod.keyboard.Key.insert,
+                "HOME": pynput_mod.keyboard.Key.home,
+                "END": pynput_mod.keyboard.Key.end,
+                "PAGE UP": pynput_mod.keyboard.Key.page_up,
+                "PAGE DOWN": pynput_mod.keyboard.Key.page_down,
+                "F1": pynput_mod.keyboard.Key.f1, "F2": pynput_mod.keyboard.Key.f2, "F3": pynput_mod.keyboard.Key.f3,
+                "F4": pynput_mod.keyboard.Key.f4, "F5": pynput_mod.keyboard.Key.f5, "F6": pynput_mod.keyboard.Key.f6,
+                "F7": pynput_mod.keyboard.Key.f7, "F8": pynput_mod.keyboard.Key.f8, "F9": pynput_mod.keyboard.Key.f9,
+                "F10": pynput_mod.keyboard.Key.f10, "F11": pynput_mod.keyboard.Key.f11, "F12": pynput_mod.keyboard.Key.f12,
             }
             if key_upper in pynput_map:
                 return ("keyboard", pynput_map[key_upper])
@@ -446,14 +476,14 @@ class PresserEngine:
 
         return None
 
-    def parse_combo(self, combo_str):
+    def parse_combo(self, combo_str: str) -> List[Any]:
         combo_clean = normalize_key_str(combo_str)
         parts = [p.strip() for p in combo_clean.split("+") if p.strip()]
         if not parts:
             parts = ["Mouse 1"]
         return [self.parse_single_key(p) for p in parts]
 
-    def press_down(self, parsed_key):
+    def press_down(self, parsed_key: Any) -> None:
         if self.backend == "evdev" and self.ui:
             self.ui.write(e.EV_KEY, parsed_key, 1)
             self.ui.syn()
@@ -464,7 +494,7 @@ class PresserEngine:
             else:
                 self.pynput_kb.press(obj)
 
-    def release(self, parsed_key):
+    def release(self, parsed_key: Any) -> None:
         if self.backend == "evdev" and self.ui:
             self.ui.write(e.EV_KEY, parsed_key, 0)
             self.ui.syn()
@@ -475,17 +505,17 @@ class PresserEngine:
             else:
                 self.pynput_kb.release(obj)
 
-    def press_combo_down(self, parsed_keys):
+    def press_combo_down(self, parsed_keys: List[Any]) -> None:
         for p_key in parsed_keys:
             if p_key:
                 self.press_down(p_key)
 
-    def release_combo_up(self, parsed_keys):
+    def release_combo_up(self, parsed_keys: List[Any]) -> None:
         for p_key in reversed(parsed_keys):
             if p_key:
                 self.release(p_key)
 
-    def click_loop(self, delay, combo_str, on_stop_cb):
+    def click_loop(self, delay: float, combo_str: str, on_stop_cb: Callable[[], None]) -> None:
         parsed_keys = self.parse_combo(combo_str)
         if not parsed_keys:
             on_stop_cb()
@@ -504,7 +534,9 @@ class PresserEngine:
         finally:
             on_stop_cb()
 
-    def sequence_loop(self, steps, sequence_delay, loop_count, on_stop_cb, on_step_progress_cb=None):
+    def sequence_loop(self, steps: List[dict], sequence_delay: float, loop_count: int,
+                       on_stop_cb: Callable[[], None],
+                       on_step_progress_cb: Optional[Callable[[int, int, int, str], None]] = None) -> None:
         if not steps:
             on_stop_cb()
             return
@@ -553,7 +585,8 @@ class PresserEngine:
         finally:
             on_stop_cb()
 
-    def type_loop(self, text, char_delay, interval_delay, on_stop_cb):
+    def type_loop(self, text: str, char_delay: float, interval_delay: float,
+                   on_stop_cb: Callable[[], None]) -> None:
         if not text:
             on_stop_cb()
             return
@@ -593,32 +626,36 @@ class PresserEngine:
         finally:
             on_stop_cb()
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_event.set()
 
 
 class GlobalHotkeyListener:
     """Monitors global system-wide single keys or key combinations (e.g., ALT+A) to toggle start/stop."""
 
-    def __init__(self, toggle_callback):
-        self.toggle_callback = toggle_callback
-        self.toggle_combo_set = set(["F8"])
-        self.toggle_str = "F8"
-        self.current_pressed = set()
-        self.listener = None
-        self.running = False
-        self.last_trigger_time = 0
+    STALE_TIMEOUT: float = 5.0  # Seconds; keys held longer are likely missed-release events
+
+    def __init__(self, toggle_callback: Callable[[], None]) -> None:
+        self.toggle_callback: Callable[[], None] = toggle_callback
+        self.toggle_combo_set: Set[str] = {"F8"}
+        self.toggle_str: str = "F8"
+        self.current_pressed: Set[str] = set()
+        self.pressed_times: Dict[str, float] = {}  # key_name -> timestamp (for stale detection)
+        self.listener: Any = None
+        self.running: bool = False
+        self.last_trigger_time: float = 0
         debug_log(f"GlobalHotkeyListener created, default key: F8")
 
-    def set_toggle_key(self, key_str):
+    def set_toggle_key(self, key_str: str) -> None:
         if key_str:
             norm = normalize_key_str(key_str)
             self.toggle_str = norm.upper().strip()
             parts = [p.strip() for p in self.toggle_str.split("+") if p.strip()]
             self.toggle_combo_set = set(parts)
 
-    def start(self):
-        if not PYNPUT_AVAILABLE or self.running:
+    def start(self) -> None:
+        pynput_mod = _ensure_pynput()
+        if not pynput_mod or self.running:
             return
         self.running = True
 
@@ -627,8 +664,16 @@ class GlobalHotkeyListener:
                 return False
             name = get_key_name_normalized(key)
             if name:
-                self.current_pressed.add(name)
                 now = time.time()
+                # Clear stale keys (held > STALE_TIMEOUT without release — missed event)
+                stale = [k for k, t in list(self.pressed_times.items()) if now - t > self.STALE_TIMEOUT]
+                for k in stale:
+                    self.current_pressed.discard(k)
+                    del self.pressed_times[k]
+
+                self.current_pressed.add(name)
+                self.pressed_times[name] = now
+
                 if self.toggle_combo_set and self.toggle_combo_set.issubset(self.current_pressed):
                     if (now - self.last_trigger_time) > 0.4:
                         self.last_trigger_time = now
@@ -637,27 +682,32 @@ class GlobalHotkeyListener:
         def on_release(key):
             name = get_key_name_normalized(key)
             if name in self.current_pressed:
-                self.current_pressed.remove(name)
+                self.current_pressed.discard(name)
+                self.pressed_times.pop(name, None)
 
         try:
-            self.listener = pynput.keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.listener = pynput_mod.keyboard.Listener(on_press=on_press, on_release=on_release)
             self.listener.daemon = True
             self.listener.start()
         except Exception as ex:
             print("Global hotkey listener notice:", ex)
 
-    def stop(self):
+    def stop(self) -> None:
         self.running = False
 
 
-def record_hotkey_universal(callback):
+def record_hotkey_universal(callback: Callable[[str], None]) -> None:
     """Universal Key & Key Combination Recorder."""
     def _worker():
         captured = ""
         done_event = threading.Event()
         current_keys = []
 
-        if PYNPUT_AVAILABLE:
+        # Small delay to avoid capturing the button click that triggered recording
+        time.sleep(0.3)
+
+        pynput_mod = _ensure_pynput()
+        if pynput_mod:
             def on_key_press(key):
                 k_name = get_key_name_normalized(key)
                 if k_name and k_name not in current_keys:
@@ -677,8 +727,8 @@ def record_hotkey_universal(callback):
                 nonlocal captured
                 if pressed and not done_event.is_set():
                     btn_name = "Mouse 1"
-                    if button == pynput.mouse.Button.middle: btn_name = "Mouse 2"
-                    elif button == pynput.mouse.Button.right: btn_name = "Mouse 3"
+                    if button == pynput_mod.mouse.Button.middle: btn_name = "Mouse 2"
+                    elif button == pynput_mod.mouse.Button.right: btn_name = "Mouse 3"
 
                     if current_keys:
                         mods = [k for k in ['CTRL', 'ALT', 'SHIFT', 'SUPER'] if k in current_keys]
@@ -689,8 +739,8 @@ def record_hotkey_universal(callback):
                     done_event.set()
                     return False
 
-            k_listener = pynput.keyboard.Listener(on_press=on_key_press, on_release=on_key_release)
-            m_listener = pynput.mouse.Listener(on_click=on_mouse_click)
+            k_listener = pynput_mod.keyboard.Listener(on_press=on_key_press, on_release=on_key_release)
+            m_listener = pynput_mod.mouse.Listener(on_click=on_mouse_click)
 
             k_listener.start()
             m_listener.start()
@@ -700,7 +750,8 @@ def record_hotkey_universal(callback):
             try:
                 k_listener.stop()
                 m_listener.stop()
-            except Exception: pass
+            except Exception as ex:
+                debug_log(f"record_hotkey: error stopping listeners: {ex}")
         elif IS_LINUX:
             proc = None
             try:
@@ -728,23 +779,32 @@ def record_hotkey_universal(callback):
                                 elif btn == "BTN_MIDDLE": captured = "Mouse 2"
                                 else: captured = "Mouse 1"
                                 break
-            except Exception: pass
+            except Exception as ex:
+                debug_log(f"record_hotkey: wev subprocess error: {ex}")
             finally:
                 if proc:
                     try:
                         proc.kill()
                         proc.wait()
-                    except Exception: pass
+                    except Exception as ex2:
+                        debug_log(f"record_hotkey: wev cleanup error: {ex2}")
 
-        callback(normalize_key_str(captured))
+        # Pass empty string if nothing was captured (callers check `if res:` to skip)
+        callback(normalize_key_str(captured) if captured else "")
 
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def record_live_macro_sequence(on_step_added, stop_event, toggle_key_str="F8", on_stopped_cb=None):
+def record_live_macro_sequence(
+    on_step_added: Callable[[dict], None],
+    stop_event: threading.Event,
+    toggle_key_str: str = "F8",
+    on_stopped_cb: Optional[Callable[[], None]] = None
+) -> None:
     """Measures real-time key/mouse presses, hold durations, and delays between actions with ESC / F8 stop trigger."""
     def _live_worker():
-        if not PYNPUT_AVAILABLE: return
+        pynput_mod = _ensure_pynput()
+        if not pynput_mod: return
 
         last_release_time = None
         press_times = {}
@@ -787,16 +847,43 @@ def record_live_macro_sequence(on_step_added, stop_event, toggle_key_str="F8", o
                 return False
 
             now = time.time()
+            # Find matching press entry — normalized name may differ between press and release
+            # on some platforms (e.g., press has char, release doesn't)
             if k in press_times:
-                press_t, delay, combo_str = press_times.pop(k)
+                match_key = k
+            else:
+                # Fallback: search press entries by key attributes
+                match_key = None
+                key_char = getattr(key, 'char', None) or ''
+                key_vk = getattr(key, 'vk', None)
+                for pk in list(press_times.keys()):
+                    # Try matching by uppercase char
+                    if key_char and isinstance(pk, str) and pk.upper() == key_char.upper():
+                        match_key = pk
+                        break
+                    # Try matching by vk code (Windows)
+                    if key_vk is not None and not key_char:
+                        for candidate_key in list(press_times.keys()):
+                            if isinstance(candidate_key, str) and len(candidate_key) <= 2:
+                                # Key codes like 65 for 'A'
+                                if str(key_vk) == str(ord(candidate_key[0])) if candidate_key else False:
+                                    match_key = candidate_key
+                                    break
+                        if match_key:
+                            break
+                if match_key is None:
+                    return  # No matching press found — skip this release
+
+            if match_key in press_times:
+                press_t, delay, combo_str = press_times.pop(match_key)
                 hold = max(20, int((now - press_t) * 1000))
                 last_release_time = now
 
-                if k in ['SHIFT', 'CTRL', 'ALT', 'SUPER']:
-                    if k in active_modifiers:
-                        active_modifiers.remove(k)
-                    if k in used_modifiers:
-                        used_modifiers.remove(k)
+                if match_key in ['SHIFT', 'CTRL', 'ALT', 'SUPER']:
+                    if match_key in active_modifiers:
+                        active_modifiers.remove(match_key)
+                    if match_key in used_modifiers:
+                        used_modifiers.remove(match_key)
                         return
 
                 if not stop_event.is_set():
@@ -838,7 +925,8 @@ def record_live_macro_sequence(on_step_added, stop_event, toggle_key_str="F8", o
         try:
             k_listener.stop()
             m_listener.stop()
-        except Exception: pass
+        except Exception as ex:
+            debug_log(f"record_live: error stopping listeners: {ex}")
 
     threading.Thread(target=_live_worker, daemon=True).start()
     debug_log(f"Live macro recording started (toggle key: {toggle_key_str})")
@@ -907,7 +995,7 @@ QHeaderView::section {
 """
 
 
-def run_qt_app(engine):
+def run_qt_app(engine: PresserEngine) -> bool:
     try:
         from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                      QGroupBox, QLabel, QLineEdit, QPushButton, QGridLayout,
@@ -916,7 +1004,7 @@ def run_qt_app(engine):
                                      QAbstractItemView, QMessageBox, QInputDialog, QDialog, QTabWidget)
         from PyQt6.QtCore import pyqtSignal, QObject, Qt, QTimer
         from PyQt6.QtGui import QShortcut, QKeySequence
-    except ImportError:
+    except ImportError:  # type: ignore[no-redef]
         try:
             from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                          QGroupBox, QLabel, QLineEdit, QPushButton, QGridLayout,
@@ -925,7 +1013,7 @@ def run_qt_app(engine):
                                          QAbstractItemView, QMessageBox, QInputDialog, QDialog, QTabWidget)
             from PyQt5.QtCore import pyqtSignal, QObject, Qt, QTimer
             from PyQt5.QtGui import QShortcut, QKeySequence
-        except ImportError:
+        except ImportError:  # type: ignore[no-redef]
             print("Qt bindings (PyQt6/PyQt5) not found.")
             return False
 
@@ -937,69 +1025,6 @@ def run_qt_app(engine):
         stop_signal = pyqtSignal()
         toggle_signal = pyqtSignal()
 
-
-    class KeyRecorderDialog(QDialog):
-        def __init__(self, parent=None):
-            super().__init__(parent)
-            self.setWindowTitle("Record Keybind")
-            self.setFixedSize(350, 180)
-            self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
-            self.setStyleSheet("background-color: #1e1e2e; color: #cdd6f4; border: 2px solid #89b4fa; border-radius: 8px;")
-            layout = QVBoxLayout(self)
-            self.lbl = QLabel("Press any key or combination...\n(e.g., CTRL + H, or Mouse Button)\n\nPress ESC to cancel.")
-            self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.lbl.setStyleSheet("font-size: 14px; font-weight: bold; border: none;")
-            layout.addWidget(self.lbl)
-            self.recorded_key = ""
-            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            self.grabKeyboard()
-        
-        def keyPressEvent(self, event):
-            mods = []
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier: mods.append("CTRL")
-            if event.modifiers() & Qt.KeyboardModifier.AltModifier: mods.append("ALT")
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier: mods.append("SHIFT")
-            if event.modifiers() & Qt.KeyboardModifier.MetaModifier: mods.append("SUPER")
-            
-            key = event.key()
-            if key == Qt.Key.Key_Escape and not mods:
-                self.reject()
-                return
-                
-            if key in [Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta]:
-                return # Wait for actual key
-            
-            key_name = ""
-            if key > 0:
-                key_name = QKeySequence(key).toString().upper()
-                
-            if not key_name or key_name.strip() == "":
-                key_name = event.text().upper()
-                
-            if not key_name and key > 0 and key < 256:
-                key_name = chr(key).upper()
-                
-            key_name = key_name.strip()
-                
-            if key_name:
-                self.recorded_key = "+".join(mods + [key_name])
-                self.accept()
-                
-        def mousePressEvent(self, event):
-            mods = []
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier: mods.append("CTRL")
-            if event.modifiers() & Qt.KeyboardModifier.AltModifier: mods.append("ALT")
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier: mods.append("SHIFT")
-            if event.modifiers() & Qt.KeyboardModifier.MetaModifier: mods.append("SUPER")
-            
-            btn = "Mouse 1"
-            if event.button() == Qt.MouseButton.RightButton: btn = "Mouse 3"
-            elif event.button() == Qt.MouseButton.MiddleButton: btn = "Mouse 2"
-            elif event.button() == Qt.MouseButton.ExtraButton1: btn = "Mouse 4"
-            elif event.button() == Qt.MouseButton.ExtraButton2: btn = "Mouse 5"
-            
-            self.recorded_key = "+".join(mods + [btn])
-            self.accept()
 
     class MahmoudPresserQtWindow(QWidget):
         def __init__(self):
@@ -1016,6 +1041,9 @@ def run_qt_app(engine):
             self.live_rec_stop_event = threading.Event()
             self.sequence_steps = []
             self.profiles = {}
+            self._config_save_timer = QTimer()
+            self._config_save_timer.setSingleShot(True)
+            self._config_save_timer.timeout.connect(self._do_save_config)
 
             self.dispatcher = QtSignalDispatcher()
             self.dispatcher.hotkey_recorded.connect(self.on_hotkey_recorded)
@@ -1039,9 +1067,11 @@ def run_qt_app(engine):
 
             self.init_ui()
 
-            self.sig_timer = QTimer()
-            self.sig_timer.timeout.connect(lambda: None)
-            self.sig_timer.start(200)
+            # Keep Qt event loop alive for cross-thread pyqtSignal delivery (pynput listener thread)
+            # A 1000ms no-op timer ensures posted events from background threads are processed
+            self._keep_alive_timer = QTimer()
+            self._keep_alive_timer.timeout.connect(lambda: None)
+            self._keep_alive_timer.start(1000)
 
             if hasattr(signal, "SIGUSR1"):
                 signal.signal(signal.SIGUSR1, lambda signum, frame: self.dispatcher.toggle_signal.emit())
@@ -1089,7 +1119,11 @@ def run_qt_app(engine):
             debug_log(f"Config loaded: mode={cfg.get('mode', 'single')}, hotkey={cfg.get('start_stop_hotkey', 'F8')}, steps={len(steps)}")
             return cfg
 
-        def save_config(self):
+        def _schedule_config_save(self) -> None:
+            """Debounced config save — batches rapid writes into a single async save."""
+            self._config_save_timer.start(500)
+
+        def _do_save_config(self) -> None:
             debug_log(f"Saving config to {CONFIG_FILE}")
             mode_str = "single"
             if hasattr(self, 'stack_widget'):
@@ -1112,6 +1146,11 @@ def run_qt_app(engine):
                 "profiles": self.profiles
             }
             save_config_atomic(CONFIG_FILE, cfg)
+
+        def save_config(self) -> None:
+            """Immediate config save (public API for non-recording operations)."""
+            self._config_save_timer.stop()
+            self._do_save_config()
 
         def init_ui(self):
             main_layout = QVBoxLayout(self)
@@ -1459,16 +1498,18 @@ def run_qt_app(engine):
                 self.seq_status_lbl.setStyleSheet("font-weight: bold; color: #a6adc8;")
 
         def start_record(self, btn, target_entry, is_sequence_record=False, is_start_stop_record=False):
-            dlg = KeyRecorderDialog(self)
-            if dlg.exec() == QDialog.DialogCode.Accepted and dlg.recorded_key:
-                res = dlg.recorded_key
-                self.on_hotkey_recorded(res, (btn, target_entry, is_sequence_record, is_start_stop_record))
-            else:
-                pass # Cancelled
+            orig_text = btn.text()
+            btn.setText("Press Keys...")
+            btn.setEnabled(False)
+            refs = (btn, target_entry, is_sequence_record, is_start_stop_record, orig_text)
+            def _cb(res):
+                # Use signal for thread-safe dispatch to Qt main thread
+                self.dispatcher.hotkey_recorded.emit(res, refs)
+            record_hotkey_universal(_cb)
 
         def on_hotkey_recorded(self, res, refs):
-            btn, target_entry, is_sequence_record, is_start_stop_record = refs
-            btn.setText("Record Keybind" if is_start_stop_record else ("Record" if is_sequence_record else "Record Key / Combo"))
+            btn, target_entry, is_sequence_record, is_start_stop_record, orig_text = refs
+            btn.setText(orig_text)
             btn.setEnabled(True)
 
             if res:
@@ -1511,7 +1552,7 @@ def run_qt_app(engine):
             self.sequence_steps.append(step)
             self.refresh_sequence_table()
             self.seq_status_lbl.setText(f"Status: 🔴 RECORDING LIVE — Captured {len(self.sequence_steps)} steps")
-            self.save_config()
+            self._schedule_config_save()
 
         def on_live_rec_stopped(self):
             self.is_live_recording = False
@@ -1691,6 +1732,9 @@ def run_qt_app(engine):
 
         def on_stop(self):
             self.engine.stop()
+            # Direct UI update — the stop_signal from the engine thread may not be
+            # reliably delivered (cross-thread pyqtSignal issue on Windows)
+            self.on_stop_ui()
 
         def on_stop_ui(self):
             self.is_running = False
@@ -1715,7 +1759,7 @@ def run_qt_app(engine):
 
 
 # Helper GTK Prompt Text Dialog
-def gtk_prompt_text(parent_win, title, message, default_text=""):
+def gtk_prompt_text(parent_win: Any, title: str, message: str, default_text: str = "") -> Optional[str]:
     try:
         import gi
         gi.require_version('Gtk', '3.0')
@@ -1792,7 +1836,7 @@ textview text {
 
 
 # --- GTK GUI Implementation ---
-def run_gtk_app(engine):
+def run_gtk_app(engine: PresserEngine) -> bool:
     try:
         import gi
         gi.require_version('Gtk', '3.0')
@@ -1834,7 +1878,8 @@ def run_gtk_app(engine):
         try:
             with open(CONFIG_FILE, "r") as f:
                 cfg_data.update(json.load(f))
-        except Exception: pass
+        except Exception as ex:
+            debug_log(f"GTK load_config: error reading {CONFIG_FILE}: {ex}")
 
     class MahmoudPresserGtk3Window(Gtk.Window):
         def __init__(self):
@@ -2209,15 +2254,18 @@ def run_gtk_app(engine):
 
             def on_live_rec_stopped_ui():
                 def _u():
-                    self.is_live_recording = False
-                    # Cleanly pop trailing Mouse 1 click used to click the Stop button!
-                    if self.sequence_steps and self.sequence_steps[-1].get("key") in ["Mouse 1", "MOUSE 1"]:
-                        self.sequence_steps.pop()
-                    refresh_sequence_table()
+                    try:
+                        self.is_live_recording = False
+                        # Cleanly pop trailing Mouse 1 click used to click the Stop button!
+                        if self.sequence_steps and self.sequence_steps[-1].get("key") in ["Mouse 1", "MOUSE 1"]:
+                            self.sequence_steps.pop()
+                        refresh_sequence_table()
 
-                    self.live_rec_btn.set_label("🔴 Record Sequence Live")
-                    self.seq_status_lbl.set_label(f"Status: ⏹ Idle ({len(self.sequence_steps)} steps ready)")
-                    self.save_config()
+                        self.live_rec_btn.set_label("🔴 Record Sequence Live")
+                        self.seq_status_lbl.set_label(f"Status: ⏹ Idle ({len(self.sequence_steps)} steps ready)")
+                        self.save_config()
+                    except Exception as ex:
+                        debug_log(f"GTK live_rec_stopped_ui: {ex}")
                     return False
                 GLib.idle_add(_u)
 
@@ -2233,15 +2281,18 @@ def run_gtk_app(engine):
 
                     def on_step(step):
                         def _u():
-                            if not self.is_live_recording:
-                                return False
-                            if self.sequence_steps:
-                                self.sequence_steps[-1]["delay_ms"] = step.get("delay_ms", 200)
-                            step["key"] = normalize_key_str(step.get("key", "Mouse 1"))
-                            self.sequence_steps.append(step)
-                            refresh_sequence_table()
-                            self.seq_status_lbl.set_label(f"Status: 🔴 RECORDING LIVE — Captured {len(self.sequence_steps)} steps")
-                            self.save_config()
+                            try:
+                                if not self.is_live_recording:
+                                    return False
+                                if self.sequence_steps:
+                                    self.sequence_steps[-1]["delay_ms"] = step.get("delay_ms", 200)
+                                step["key"] = normalize_key_str(step.get("key", "Mouse 1"))
+                                self.sequence_steps.append(step)
+                                refresh_sequence_table()
+                                self.seq_status_lbl.set_label(f"Status: 🔴 RECORDING LIVE — Captured {len(self.sequence_steps)} steps")
+                                self.save_config()
+                            except Exception as ex:
+                                debug_log(f"GTK live step: {ex}")
                             return False
                         GLib.idle_add(_u)
 
@@ -2254,17 +2305,20 @@ def run_gtk_app(engine):
                 btn.set_sensitive(False)
                 def _cb(res):
                     def _u():
-                        btn.set_label("Record Keybind")
-                        btn.set_sensitive(True)
-                        if res:
-                            formatted = normalize_key_str(res)
-                            self.toggle_hk_entry.set_text(formatted)
-                            self.start_stop_keybind = formatted
-                            self.banner_lbl.set_label(f"⚡ Global Keybind [{formatted}] to Start/Stop:")
-                            start_btn.set_label(f"Start ({formatted})")
-                            stop_btn.set_label(f"Stop ({formatted})")
-                            self.global_listener.set_toggle_key(formatted)
-                            self.save_config()
+                        try:
+                            btn.set_label("Record Keybind")
+                            btn.set_sensitive(True)
+                            if res:
+                                formatted = normalize_key_str(res)
+                                self.toggle_hk_entry.set_text(formatted)
+                                self.start_stop_keybind = formatted
+                                self.banner_lbl.set_label(f"⚡ Global Keybind [{formatted}] to Start/Stop:")
+                                start_btn.set_label(f"Start ({formatted})")
+                                stop_btn.set_label(f"Stop ({formatted})")
+                                self.global_listener.set_toggle_key(formatted)
+                                self.save_config()
+                        except Exception as ex:
+                            debug_log(f"GTK rec_toggle callback: {ex}")
                         return False
                     GLib.idle_add(_u)
                 record_hotkey_universal(_cb)
@@ -2276,11 +2330,14 @@ def run_gtk_app(engine):
                 btn.set_sensitive(False)
                 def _rec_cb(res):
                     def _u():
-                        btn.set_label("Record")
-                        btn.set_sensitive(True)
-                        if res:
-                            formatted = normalize_key_str(res)
-                            target.set_text(formatted)
+                        try:
+                            btn.set_label("Record")
+                            btn.set_sensitive(True)
+                            if res:
+                                formatted = normalize_key_str(res)
+                                target.set_text(formatted)
+                        except Exception as ex:
+                            debug_log(f"GTK rec callback: {ex}")
                         return False
                     GLib.idle_add(_u)
                 record_hotkey_universal(_rec_cb)
@@ -2300,19 +2357,23 @@ def run_gtk_app(engine):
 
             def on_stop_ui():
                 def _u():
-                    self.is_running = False
-                    start_btn.set_sensitive(True)
-                    stop_btn.set_sensitive(False)
-                    self.seq_status_lbl.set_label(f"Status: ⏹ Idle ({len(self.sequence_steps)} steps in macro)")
+                    try:
+                        self.is_running = False
+                        start_btn.set_sensitive(True)
+                        stop_btn.set_sensitive(False)
+                        self.seq_status_lbl.set_label(f"Status: ⏹ Idle ({len(self.sequence_steps)} steps in macro)")
+                    except Exception as ex:
+                        debug_log(f"GTK on_stop_ui: {ex}")
                     return False
                 GLib.idle_add(_u)
 
             def on_progress(step_idx, total_steps, current_loop, key_name):
                 def _u():
-                    self.seq_status_lbl.set_label(f"Status: ▶ RUNNING MACRO | Loop {current_loop} | Step {step_idx+1}/{total_steps} [{key_name}]")
                     try:
+                        self.seq_status_lbl.set_label(f"Status: ▶ RUNNING MACRO | Loop {current_loop} | Step {step_idx+1}/{total_steps} [{key_name}]")
                         self.seq_tree.get_selection().select_path(Gtk.TreePath.new_from_string(str(step_idx)))
-                    except Exception: pass
+                    except Exception as ex:
+                        debug_log(f"GTK on_progress: {ex}")
                     return False
                 GLib.idle_add(_u)
 
@@ -2382,7 +2443,7 @@ def run_gtk_app(engine):
     return True
 
 
-def print_progress_bar(current, total, label, bar_width=24):
+def print_progress_bar(current: int, total: int, label: str, bar_width: int = 24) -> None:
     """Draw a clean text-based progress bar to the terminal."""
     percent = current / total if total > 0 else 1.0
     filled = int(bar_width * percent)
@@ -2393,36 +2454,26 @@ def print_progress_bar(current, total, label, bar_width=24):
         print()
 
 
-def check_import(pkg):
-    """Try to import a package. Returns True if available."""
+def check_import(pkg: str) -> bool:
+    """Check if a package is available without fully importing it (uses find_spec for speed)."""
     try:
         if pkg == "PyQt6":
-            try:
-                from PyQt6.QtWidgets import QApplication
-                return True
-            except ImportError:
-                try:
-                    from PyQt5.QtWidgets import QApplication
-                    return True
-                except ImportError:
-                    return False
+            # Check for PyQt6 or PyQt5 (both work via fallback imports in run_qt_app)
+            return (importlib.util.find_spec("PyQt6") is not None or
+                    importlib.util.find_spec("PyQt5") is not None)
         elif pkg == "pynput":
-            import pynput
-            return True
+            return importlib.util.find_spec("pynput") is not None
         elif pkg == "python-xlib":
-            import Xlib
-            return True
+            return importlib.util.find_spec("Xlib") is not None
         elif pkg == "evdev":
-            from evdev import ecodes
-            return True
+            return importlib.util.find_spec("evdev") is not None
         else:
-            __import__(pkg)
-            return True
-    except ImportError:
+            return importlib.util.find_spec(pkg) is not None
+    except Exception:
         return False
 
 
-def ensure_dependencies():
+def ensure_dependencies() -> None:
     """Check & auto-install missing Python dependencies. Silent when all are satisfied."""
     # Platform-specific package sets
     if IS_WINDOWS:
@@ -2487,7 +2538,20 @@ def ensure_dependencies():
     print()
 
 
-def main():
+def main() -> None:
+    # Auto-redirect to virtual environment (before any imports that may fail)
+    _venv_linux = os.path.expanduser("~/venv/bin/python3")
+    _venv_win = os.path.expanduser("~/venv/Scripts/python.exe")
+    _venv_python = _venv_win if IS_WINDOWS else _venv_linux
+    if (not getattr(sys, 'frozen', False)
+            and os.path.exists(_venv_python)
+            and sys.executable != _venv_python
+            and "--no-reexec" not in sys.argv):
+        try:
+            os.execv(_venv_python, [_venv_python] + sys.argv)
+        except Exception:
+            pass
+
     ensure_dependencies()
     parser = argparse.ArgumentParser(description="Mahmoud Presser - Cross-Platform Auto Clicker, Macro & Auto Typer")
     parser.add_argument("--qt", action="store_true", help="Force Qt GUI")
@@ -2540,7 +2604,9 @@ def main():
     debug_log(f"Platform: {platform.system()}, Python: {sys.version}")
     debug_log(f"Arguments: {sys.argv[1:]}")
 
+    global _engine_ref
     engine = PresserEngine()
+    _engine_ref = engine
 
     if args.qt:
         if not run_qt_app(engine):
@@ -2567,8 +2633,12 @@ def main():
                 print("To run this app on Windows, please install PyQt6:")
                 print("    pip install PyQt6")
             elif IS_MACOS:
-                print("To run this app on macOS, please install PyQt6:")
-                print("    pip3 install PyQt6")
+                print("To run this app on macOS:")
+                print("  1. Install Python (if not already): brew install python@3.12")
+                print("  2. Install dependencies: pip3 install PyQt6 pynput")
+                print("  3. Grant Accessibility permission:")
+                print("     System Settings → Privacy & Security → Accessibility")
+                print("     → Add Terminal/iTerm2 and the python3 binary")
             else:
                 print("To run this app on Linux, install PyQt6 or GTK3 bindings:")
                 print("    pip3 install PyQt6")

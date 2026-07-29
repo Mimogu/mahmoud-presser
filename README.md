@@ -36,8 +36,42 @@ If you are on Ubuntu, Fedora, or another distribution, you can run the standalon
    ```
 2. Run the script:
    ```bash
-   python3 linux_clicker.py
+   python3 mahmoud-presser.py
    ```
+
+---
+
+## 🍎 Installation for macOS
+
+### Prerequisites
+Mahmoud Presser uses `pynput` for keyboard/mouse control, which requires **Accessibility permissions** on macOS.
+
+### Step-by-Step:
+
+1. **Install Python (if not already installed):**
+   Using Homebrew:
+   ```bash
+   brew install python@3.12
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   pip3 install PyQt6 pynput
+   ```
+
+3. **Grant Accessibility permission:**
+   macOS requires explicit permission for apps to control keyboard/mouse.
+   - Open **System Settings → Privacy & Security → Accessibility**
+   - Click the **+** button and add your terminal app (Terminal, iTerm2, etc.)
+   - Also add the `python3` binary: `/usr/local/bin/python3` (or `/opt/homebrew/bin/python3` on Apple Silicon)
+   - Toggle the switch to enable access
+
+4. **Run the app:**
+   ```bash
+   python3 mahmoud-presser.py
+   ```
+
+> **Note:** If you see "pynput fails to monitor keyboard" errors, double-check the Accessibility permissions above. You may need to restart your terminal after granting permissions.
 
 ---
 
@@ -59,7 +93,10 @@ If you are on Ubuntu, Fedora, or another distribution, you can run the standalon
    ```
 
 3. **Run the App:** 
-   You can now simply double-click the `windows_clicker.py` script to run it, or if you downloaded the lightweight `.exe` version, you can now run it perfectly!
+   You can now simply double-click the `mahmoud-presser.py` script or run it from the terminal:
+   ```cmd
+   python mahmoud-presser.py
+   ```
 
 ---
 
